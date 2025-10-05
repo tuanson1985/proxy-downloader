@@ -41,4 +41,3 @@ proxy_downloader.exe loop
 ---
 
 File này ngắn gọn để bạn dán vào `README.md`. Muốn mình thêm logo nhỏ hoặc hướng dẫn GUI chi tiết không?
-

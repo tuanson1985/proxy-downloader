@@ -1,13 +1,22 @@
 ﻿// proxy_downloader.cpp
 // Build: cl /EHsc proxy_downloader.cpp winhttp.lib
 //
-// Features:
-//  - Download URL (WinHTTP) to C:\Users\Administrator\Desktop\G2G\proxy\Webshare 100 proxies.txt
-//  - Split list into two files: ...\01\proxy\proxy.txt and ...\02\proxy\proxy.txt
-//  - install-task HH:MM  -> create a Scheduled Task "DownloadWebshareProxies" daily at HH:MM (default 02:00)
-//  - uninstall-task -> delete the Scheduled Task
-//  - run as normal: proxy_downloader.exe
-//  - run as "proxy_downloader.exe loop" -> loop every 6 hours (not recommended vs Task Scheduler)
+// Behavior changed per user request:
+//  - Read list of target directories from file.txt (next to exe)
+//  - Download proxies once
+//  - Distribute downloaded proxy lines across target directories (round-robin)
+//  - For each target directory, write file: <targetDir>\proxy.txt (overwritten)
+//  - install-task / uninstall-task and loop behavior unchanged
+//
+// Usage:
+//  - file.txt lines: each line is a directory (no trailing \proxy). Example:
+//      C:\Users\Administrator\Desktop\G2G\01
+//      C:\Users\Administrator\Desktop\G2G\02
+//
+//  - Build: cl /EHsc proxy_downloader.cpp winhttp.lib
+//  - Run: proxy_downloader.exe
+//  - Run loop: proxy_downloader.exe loop
+//  - Install task: proxy_downloader.exe install-task 02:00
 
 #include <windows.h>
 #include <winhttp.h>
@@ -184,25 +193,47 @@ bool MoveFileReplace(const std::wstring& src, const std::wstring& dst, std::stri
     return true;
 }
 
-// Scheduled Task helpers
-bool CreateScheduledTaskDailyWithLog(const std::wstring& taskName, const std::wstring& exePath, const std::wstring& startTime, std::wstring& outMsg) {
-    // validate HH:MM
-    if (startTime.size() != 5 || startTime[2] != L':') { outMsg = L"Invalid time format (HH:MM)"; return false; }
+// Helpers to load target dirs from "file.txt" (next to EXE)
+static std::wstring TrimW(const std::wstring& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && (s[a] == L' ' || s[a] == L'\t' || s[a] == L'\r' || s[a] == L'\n')) ++a;
+    while (b > a && (s[b - 1] == L' ' || s[b - 1] == L'\t' || s[b - 1] == L'\r' || s[b - 1] == L'\n')) --b;
+    return s.substr(a, b - a);
+}
 
-    // Build TR that runs cmd /c "exePath > run.log 2>&1"
-    // Compose run.log path next to exe
+bool LoadTargetDirsFromFile(const std::wstring& filePath, std::vector<std::wstring>& outDirs) {
+    outDirs.clear();
+    std::ifstream f(std::string(filePath.begin(), filePath.end()));
+    if (!f.is_open()) return false;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t a = 0, b = line.size();
+        while (a < b && (line[a] == ' ' || line[a] == '\t')) ++a;
+        while (b > a && (line[b - 1] == ' ' || line[b - 1] == '\t')) --b;
+        std::string s = (a < b) ? line.substr(a, b - a) : std::string();
+        if (s.empty()) continue;
+        if (s.rfind("#", 0) == 0) continue;
+        if (s.rfind("//", 0) == 0) continue;
+
+        // convert to wide
+        std::wstring ws(s.begin(), s.end());
+        ws = TrimW(ws);
+        if (!ws.empty()) outDirs.push_back(ws);
+    }
+    return !outDirs.empty();
+}
+
+// Scheduled Task helpers (unchanged)
+bool CreateScheduledTaskDailyWithLog(const std::wstring& taskName, const std::wstring& exePath, const std::wstring& startTime, std::wstring& outMsg) {
+    if (startTime.size() != 5 || startTime[2] != L':') { outMsg = L"Invalid time format (HH:MM)"; return false; }
     size_t pos = exePath.find_last_of(L"\\/");
     std::wstring exeDir = (pos == std::wstring::npos) ? L"." : exePath.substr(0, pos);
     std::wstring runLog = exeDir + L"\\run.log";
-
-    // Need to pass TR as: cmd /c "<exePath> > <runLog> 2>&1"
-    // And schtasks expects /TR "cmd /c \"...\""
     std::wstring inner = L"\"" + exePath + L"\" > \"" + runLog + L"\" 2>&1";
     std::wstring tr = L"\"cmd /c " + inner + L"\"";
-
-    // Full schtasks command
     std::wstring cmd = L"schtasks /Create /TN \"" + taskName + L"\" /TR " + tr + L" /SC DAILY /ST " + startTime + L" /RL HIGHEST /F";
-
     int rc = RunCommandPrintRC(cmd);
     if (rc != 0) { outMsg = L"schtasks returned code " + std::to_wstring(rc); return false; }
     outMsg = L"Task created (or overwritten). Runs daily at " + startTime + L". Log: " + runLog;
@@ -217,20 +248,34 @@ bool DeleteScheduledTask(const std::wstring& taskName, std::wstring& outMsg) {
     return true;
 }
 
-// core wrapper (download and split)
+// core wrapper (download and distribute)
 int wmain_wrapper(int argc, wchar_t* argv[]) {
     std::wstring url = L"https://proxy.webshare.io/api/v2/proxy/list/download/aywcsahndhodhcrsegrqyjhxynzldqanalskuirv/-/any/username/direct/-/";
-    std::wstring baseDir = L"C:\\Users\\Administrator\\Desktop\\G2G";
-    std::wstring downloadDir = baseDir + L"\\proxy";
-    std::wstring downloadFileName = L"Webshare 100 proxies.txt";
-    std::wstring downloadFilePath = downloadDir + L"\\" + downloadFileName;
 
-    std::wstring dest1 = baseDir + L"\\01\\proxy\\proxy.txt";
-    std::wstring dest2 = baseDir + L"\\02\\proxy\\proxy.txt";
+    wchar_t exePathBuf[MAX_PATH]; GetModuleFileNameW(NULL, exePathBuf, MAX_PATH);
+    std::wstring exePath = exePathBuf;
+    size_t exep = exePath.find_last_of(L"\\/");
+    std::wstring exeDir = (exep == std::wstring::npos) ? L"." : exePath.substr(0, exep);
+    std::wstring listFile = exeDir + L"\\file.txt";
 
-    if (!EnsureDirectoryExists(downloadDir)) { std::wcerr << L"Failed ensure: " << downloadDir << L"\n"; return 1; }
-    if (!EnsureDirectoryExists(baseDir + L"\\01\\proxy")) { std::wcerr << L"Failed ensure: " << baseDir + L"\\01\\proxy\n"; return 1; }
-    if (!EnsureDirectoryExists(baseDir + L"\\02\\proxy")) { std::wcerr << L"Failed ensure: " << baseDir + L"\\02\\proxy\n"; return 1; }
+    std::vector<std::wstring> targets;
+    if (!LoadTargetDirsFromFile(listFile, targets)) {
+        // fallback: single default
+        std::wstring fallback = L"C:\\Users\\Administrator\\Desktop\\G2G\\01";
+        targets.push_back(fallback);
+        std::wcout << L"[INFO] file.txt missing/empty -> using fallback target: " << fallback << L"\n";
+    }
+    else {
+        std::wcout << L"[INFO] Loaded " << (unsigned)targets.size() << L" target dir(s) from file.txt\n";
+    }
+
+    // Ensure target directories exist (we will write proxy.txt inside each)
+    for (const auto& t : targets) {
+        if (!EnsureDirectoryExists(t)) {
+            std::wcerr << L"Failed to create/ensure target dir: " << t << L"\n";
+            return 1;
+        }
+    }
 
     std::string data; std::string errmsg;
     if (!DownloadToString(url, data, errmsg)) {
@@ -238,61 +283,49 @@ int wmain_wrapper(int argc, wchar_t* argv[]) {
         return 2;
     }
 
-    bool saved = SaveStringToFile(downloadFilePath, data, errmsg);
-    if (saved) {
-        std::wcout << L"Saved master file to: " << downloadFilePath << L"\n";
-    }
-    else {
-        std::wcerr << L"Save master to target failed: " << std::wstring(errmsg.begin(), errmsg.end()) << L"\n";
-        wchar_t curDirBuf[MAX_PATH]; DWORD len = GetCurrentDirectoryW(MAX_PATH, curDirBuf);
-        std::wstring curDir = (len > 0) ? std::wstring(curDirBuf) : std::wstring(L".");
-        std::wstring fallback = curDir + L"\\" + downloadFileName;
-        std::wcerr << L"Attempting fallback at: " << fallback << L"\n";
-        if (SaveStringToFile(fallback, data, errmsg)) {
-            std::wcout << L"Saved fallback master file to: " << fallback << L"\n";
-            if (MoveFileReplace(fallback, downloadFilePath, errmsg)) {
-                std::wcout << L"Moved fallback file into proxy folder: " << downloadFilePath << L"\n";
-            }
-            else {
-                std::wcerr << L"Failed to move fallback into proxy folder: " << std::wstring(errmsg.begin(), errmsg.end()) << L"\n";
-            }
-        }
-        else {
-            std::wcerr << L"Failed to save fallback file too: " << std::wstring(errmsg.begin(), errmsg.end()) << L"\n";
-            return 3;
-        }
-    }
-
+    // split and clean lines
     auto lines = SplitLines(data);
     std::vector<std::string> cleaned; cleaned.reserve(lines.size());
     for (auto& ln : lines) {
         std::string t = ln;
-        while (!t.empty() && (t.back() == '\r' || t.back() == '\n' || t.back() == ' ' || t.back() == '\t')) t.pop_back();
-        size_t p = 0; while (p < t.size() && (t[p] == ' ' || t[p] == '\t')) ++p;
+        while (!t.empty() && (t.back() == '\\r' || t.back() == '\\n' || t.back() == ' ' || t.back() == '\\t')) t.pop_back();
+        size_t p = 0; while (p < t.size() && (t[p] == ' ' || t[p] == '\\t')) ++p;
         if (p > 0) t = t.substr(p);
         if (!t.empty()) cleaned.push_back(t);
     }
-    size_t total = cleaned.size();
-    if (total == 0) {
-        std::wcout << L"No proxies found.\n";
-        SaveStringToFile(dest1, std::string(), errmsg);
-        SaveStringToFile(dest2, std::string(), errmsg);
+
+    if (cleaned.empty()) {
+        std::wcout << L"No proxies found in downloaded data. Writing empty proxy.txt to each target.\n";
+        for (const auto& t : targets) {
+            std::wstring outPath = t + L"\\proxy.txt";
+            SaveStringToFile(outPath, std::string(), errmsg);
+        }
         return 0;
     }
-    size_t half = total / 2; if (total % 2 != 0) ++half;
-    std::ostringstream s1, s2;
-    for (size_t i = 0; i < total; ++i) { if (i < half) s1 << cleaned[i] << "\r\n"; else s2 << cleaned[i] << "\r\n"; }
 
-    if (!SaveStringToFile(dest1, s1.str(), errmsg)) { std::wcerr << L"Failed write dest1: " << std::wstring(errmsg.begin(), errmsg.end()) << L"\n"; return 4; }
-    if (!SaveStringToFile(dest2, s2.str(), errmsg)) { std::wcerr << L"Failed write dest2: " << std::wstring(errmsg.begin(), errmsg.end()) << L"\n"; return 5; }
+    // Distribute round-robin across targets
+    size_t nTargets = targets.size();
+    std::vector<std::vector<std::string>> buckets(nTargets);
+    for (size_t i = 0; i < cleaned.size(); ++i) {
+        buckets[i % nTargets].push_back(cleaned[i]);
+    }
 
-    std::wcout << L"Wrote " << half << L" proxies to " << dest1 << L"\n";
-    std::wcout << L"Wrote " << (total - half) << L" proxies to " << dest2 << L"\n";
+    // Write each bucket to target\proxy.txt
+    for (size_t i = 0; i < nTargets; ++i) {
+        std::ostringstream ss;
+        for (const auto& ln : buckets[i]) ss << ln << "\r\n";
+        std::wstring outPath = targets[i] + L"\\proxy.txt";
+        if (!SaveStringToFile(outPath, ss.str(), errmsg)) {
+            std::wcerr << L"Failed to write " << outPath << L" : " << std::wstring(errmsg.begin(), errmsg.end()) << L"\n";
+            return 4;
+        }
+        std::wcout << L"Wrote " << buckets[i].size() << L" proxies to " << outPath << L"\n";
+    }
+
     return 0;
 }
 
 int wmain(int argc, wchar_t* argv[]) {
-    // handle install/uninstall args first
     std::wstring taskName = L"DownloadWebshareProxies";
 
     if (argc >= 2) {
@@ -326,7 +359,6 @@ int wmain(int argc, wchar_t* argv[]) {
         }
     }
 
-    // normal run or loop
     bool loop = false;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
