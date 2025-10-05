@@ -39,5 +39,3 @@ proxy_downloader.exe loop
 - Nếu task bị bỏ lỡ do máy ngủ/tắt: bật `Wake the computer to run this task` và `Run task as soon as possible after a missed start` trong Task Scheduler (GUI).
 
 ---
-
-File này ngắn gọn để bạn dán vào `README.md`. Muốn mình thêm logo nhỏ hoặc hướng dẫn GUI chi tiết không?
